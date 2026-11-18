@@ -1,35 +1,26 @@
-"""Flush trader for the BTC 24h race (agent-fun/bars-replay/v1).
+"""Dip-buy cbBTC bot for make.fun's 24-hour BTC race.
 
-The market this bot trades is Coinbase Wrapped BTC against USDC, replayed one
-minute at a time from on-chain pool state. The harness opens with a hello
-message naming the universe, the capital and the fees, then sends one batch
-per minute: the bar that just closed, the fills of the previous reply's
-orders, and the account. The bot answers each batch with exactly one reply
-carrying its orders, then waits for the next bar.
+The idea is simple: Bitcoin flushes hard inside the day and then recovers,
+so the bot waits for a sharp flush, buys it at full size, and sells the
+recovery. It makes at most two dip buys a day and otherwise sits in cash.
 
-The edge is simple and it is the only edge this bot claims: Bitcoin drops
-hard inside the day and then climbs back. So the bot does nothing most of the
-time, waits for a drop worth trading, buys it with everything it has, and
-sells the climb back. It never chases, never averages down on a shallow dip,
-and never trades twice on the same flush.
-
-Three windows of real bars back this shape. On the Nov 17 race the winning
-bots were all dip buyers with two to eight trades, while the high-frequency
-house bot lost $149 on 79 trades. Our own Nov 17 entry bought a 1.00% dip
-that kept falling and lost $17.61 on it, finishing the race window at -$0.04
-even though its dev window showed +$30.93. That is why the first buy here
-needs a 1.20% drop, not 1.00%: the deeper bar skips the noise dips. With it,
-the same bot is profitable on all three windows we can replay — the new dev
-window (+$17.84), the old dev window (+$12.20) and the old race window
-(+$17.84) — where the 1.00% version lost money on the race window.
-
-A round trip costs about 26 bps in fees, slippage and price impact, so every
-rule below is sized against that: no trade is worth taking unless the move
-it hunts is several times the cost of the trip.
-
-All arithmetic is integer math on bar closes. No clock, no network, no
-randomness, no files outside the repository, so two runs on the same bars
+All decisions use integer arithmetic on bar closes. No clock, no network, no
+randomness, nothing read from the environment, so two runs on the same bars
 answer byte for byte the same.
+
+Rules (all thresholds in basis points, 1 bp = 0.01%):
+- Buy the dip: the close is at least 120 bps below the trailing 60-bar
+  high, fell at least 50 bps over the last 15 bars (or is already 150 bps
+  deep), and the last 5 bars stopped falling (down less than 5 bps). A
+  second dip buy needs a deeper flush, 150 bps below the high.
+- Sell the recovery: take profit at +200 bps from the entry close, hard
+  stop at -150 bps, trailing stop once +100 bps up (sell 100 bps below the
+  peak close), or 8 hours after entry, whichever comes first.
+- Fallback: if the bot never traded by bar 1080, one trend entry on a fresh
+  60-bar high after a 60-bar run of at least +40 bps, so a flat window still
+  leaves it with a trade. No new position after bar 1380.
+
+Speaks agent-fun/bars-replay/v1 through the kit's Python shim.
 """
 
 import os
@@ -40,144 +31,156 @@ import makefun_bars
 
 SYMBOL = "CBBTC"
 
-# First buy: the close must sit this far below the trailing 60-bar high.
-DIP_MIN_BPS = 120
-# Any later buy must be deeper still.
-DIP_DEEP_BPS = 150
-# The drop must be a flush, not a drift: this much down over 15 bars,
-# unless the dip is already deep.
+# How far back the trailing high looks, in bars.
+HIGH_BARS = 60
+# First dip buy: close this far below the trailing high.
+FIRST_DIP_BPS = 120
+# Second dip buy: only on a deeper flush than the first.
+SECOND_DIP_BPS = 150
+# A fast flush: this far down over the last 15 bars.
+FLUSH_BARS = 15
 FLUSH_BPS = 50
-# The last 5 bars must have stopped falling this fast.
+# Settled: the last 5 bars down less than this.
+SETTLE_BARS = 5
 SETTLE_BPS = 5
-# Exits, measured from the fill price of the buy.
-PROFIT_BPS = 200
-LOSS_BPS = 150
-TRAIL_START_BPS = 100
-TRAIL_SLIP_BPS = 100
-# Bars held before the position is closed for time (8 hours).
-HOLD_LIMIT = 480
-# Late fallback, only if the bot never traded: buy a fresh 60-bar high
-# after a quiet climb.
-LATE_BAR = 1080
-LATE_RUN_BPS = 40
-# No new position in the last hour: a buy that late cannot mature before
-# the final flatten, so it would only pay for the round trip.
-LAST_BUY_BAR = 1380
-# At most this many dip buys in one window.
-MAX_BUYS = 2
-# Wide enough to survive a fast bar, tight enough to refuse a bad fill.
-SLIP_BPS = 150
+# Exits, from the entry close.
+TAKE_BPS = 200
+STOP_BPS = 150
+# Trailing stop: arms this far up, sells this far below the peak close.
+TRAIL_ARM_BPS = 100
+TRAIL_GIVE_BPS = 100
+# Time cap, in bars (8 hours).
+TIME_CAP_BARS = 480
+# Fallback window: first trend entry no earlier than this bar, none after this one.
+FALLBACK_BAR = 1080
+LAST_ENTRY_BAR = 1380
+# Fallback needs a 60-bar run of at least this.
+FALLBACK_RUN_BPS = 40
+# Max slippage the harness may move a fill from the latest close.
+SLIPPAGE_BPS = 150
 
 
-def drop_bps(price, ref):
-    """(price / ref - 1) in basis points, integer math, negative when below."""
-    return (price - ref) * 10_000 // ref
+def _drop_bps(high, close):
+    """How far below `high` the `close` sits, in basis points."""
+    return (high - close) * 10_000 // high
 
 
-class FlushTrader:
+def _move_bps(earlier, later):
+    """The move from `earlier` to `later`, in basis points (negative when down)."""
+    return (later - earlier) * 10_000 // earlier
+
+
+class DipTrader:
+    """The strategy's memory: closes seen, the open position, pending orders."""
+
     def __init__(self):
-        self.seen = []          # closes, in bar order
-        self.bought_price = None  # fill price of the open position, or None
-        self.bought_seq = None    # seq of the batch the buy fill arrived on
-        self.best = None          # highest close since the buy
-        self.buys = 0             # filled buys so far
+        self.closes = []
+        self.entry_close = None
+        self.entry_seq = None
+        self.peak_close = None
+        self.pending = None
+        self.dip_buys = 0
+        self.fallback_done = False
 
-    def on_batch(self, state, batch):
-        if state.warming_up:
-            return []
-        for fill in batch["fills"]:
-            if fill["status"] != "filled":
-                continue
-            if fill["side"] == "buy":
-                self.buys += 1
-                self.bought_price = int(fill["price"])
-                self.bought_seq = state.seq
-                self.best = self.bought_price
-            elif fill["side"] == "sell":
-                self.bought_price = None
-                self.bought_seq = None
-                self.best = None
-        bar = state.latest.get(SYMBOL)
-        if bar is None:
-            return []
-        close = int(bar["c"])
-        self.seen.append(close)
-        holding = state.positions.get(SYMBOL)
-        if holding is None:
-            self.bought_price = None
-            self.bought_seq = None
-            self.best = None
-            return self._buy(state, close)
-        if self.bought_price is None:
-            # Holding a position with no fill on record (should not happen):
-            # anchor the exit rules on the close so they still have a base.
-            self.bought_price = close
-            self.bought_seq = state.seq
-            self.best = close
-        if close > self.best:
-            self.best = close
-        reason = self._exit_reason(state, close)
-        if reason is None:
-            return []
-        return self._sell_all(holding)
+    def holding(self, state):
+        return SYMBOL in state.positions
 
-    def _trailing_high(self):
-        """Highest close of the 60 bars before the latest one."""
-        high = None
-        for i in range(len(self.seen) - 61, len(self.seen) - 1):
-            price = self.seen[i]
-            if high is None or price > high:
-                high = price
-        return high
+    def note_close(self, close):
+        self.closes.append(close)
 
-    def _buy(self, state, close):
-        history = self.seen
-        if len(history) < 61 or state.cash < 1_000_000:
-            return []
-        high = self._trailing_high()
-        dip = drop_bps(close, high)
-        scored = state.seq - state.warmup_bars
-        if scored > LAST_BUY_BAR:
-            return []
-        if self.buys < MAX_BUYS:
-            need = DIP_MIN_BPS if self.buys == 0 else DIP_DEEP_BPS
-            flushing = drop_bps(close, history[-16]) <= -FLUSH_BPS
-            settled = drop_bps(close, history[-6]) >= -SETTLE_BPS
-            if dip <= -need and (flushing or dip <= -DIP_DEEP_BPS) and settled:
-                return self._buy_all(state)
-        if self.buys == 0 and scored >= LATE_BAR:
-            climb = drop_bps(close, history[-61])
-            if close >= high and climb >= LATE_RUN_BPS:
-                return self._buy_all(state)
-        return []
+    def settle_pending(self, state):
+        """A buy sent on an earlier batch has filled or been rejected by now."""
+        if self.pending is None or state.seq <= self.pending[1]:
+            return
+        close, _seq, kind = self.pending
+        self.pending = None
+        if self.holding(state):
+            self.entry_close = close
+            self.entry_seq = _seq
+            self.peak_close = close
+            if kind == "dip":
+                self.dip_buys += 1
 
-    def _exit_reason(self, state, close):
-        gain = drop_bps(close, self.bought_price)
-        if gain >= PROFIT_BPS or gain <= -LOSS_BPS:
-            return "take-or-stop"
-        armed = drop_bps(self.best, self.bought_price) >= TRAIL_START_BPS
-        faded = drop_bps(close, self.best) <= -TRAIL_SLIP_BPS
-        if armed and faded:
-            return "trailing"
-        if state.seq - self.bought_seq >= HOLD_LIMIT:
-            return "time"
+    def dip_signal(self, close):
+        """True when the flush is deep and fast enough and has stopped falling."""
+        if len(self.closes) < HIGH_BARS + 1:
+            return False
+        high = max(self.closes[-HIGH_BARS:])
+        needed = FIRST_DIP_BPS if self.dip_buys == 0 else SECOND_DIP_BPS
+        drop = _drop_bps(high, close)
+        if drop < needed:
+            return False
+        flush = _move_bps(self.closes[-FLUSH_BARS - 1], close)
+        if flush < -FLUSH_BPS and drop < SECOND_DIP_BPS:
+            return False
+        settled = _move_bps(self.closes[-SETTLE_BARS - 1], close)
+        return settled > -SETTLE_BPS
+
+    def fallback_signal(self, close):
+        """True on a fresh 60-bar high after a 60-bar run, once only."""
+        if self.fallback_done or self.dip_buys > 0:
+            return False
+        if len(self.closes) < HIGH_BARS + 1:
+            return False
+        if close <= max(self.closes[-HIGH_BARS - 1:-1]):
+            return False
+        run = _move_bps(self.closes[-HIGH_BARS - 1], close)
+        return run >= FALLBACK_RUN_BPS
+
+    def exit_now(self, state, close):
+        """Which exit, if any, the current close triggers."""
+        if self.entry_close is None:
+            return None
+        if close > self.peak_close:
+            self.peak_close = close
+        if _move_bps(self.entry_close, close) >= TAKE_BPS:
+            return "take-profit"
+        if _move_bps(close, self.entry_close) >= STOP_BPS:
+            return "hard-stop"
+        if self.peak_close * 10_000 >= self.entry_close * (10_000 + TRAIL_ARM_BPS):
+            if close * 10_000 <= self.peak_close * (10_000 - TRAIL_GIVE_BPS):
+                return "trailing-stop"
+        if state.seq - self.entry_seq >= TIME_CAP_BARS:
+            return "time-cap"
         return None
 
-    def _buy_all(self, state):
+    def decide(self, state, batch):
+        close = state.close(SYMBOL)
+        if close is None or state.warming_up:
+            return []
+        self.note_close(close)
+        self.settle_pending(state)
+        if self.holding(state):
+            if self.exit_now(state, close) is not None:
+                held = state.positions[SYMBOL]
+                self.entry_close = None
+                self.entry_seq = None
+                self.peak_close = None
+                return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty,
+                         "max_slippage_bps": SLIPPAGE_BPS}]
+            return []
+        if state.seq > LAST_ENTRY_BAR:
+            return []
+        kind = None
+        if self.dip_buys < 2 and self.dip_signal(close):
+            kind = "dip"
+        elif state.seq >= FALLBACK_BAR and self.fallback_signal(close):
+            kind = "fallback"
+        if kind is None:
+            return []
+        self.pending = (close, state.seq, kind)
+        if kind == "fallback":
+            self.fallback_done = True
         return [{"side": "buy", "symbol": SYMBOL,
                  "notional_quote_units": state.cash,
-                 "max_slippage_bps": SLIP_BPS}]
-
-    def _sell_all(self, holding):
-        return [{"side": "sell", "symbol": SYMBOL,
-                 "qty": holding.qty,
-                 "max_slippage_bps": SLIP_BPS}]
+                 "max_slippage_bps": SLIPPAGE_BPS}]
 
 
-def main():
-    trader = FlushTrader()
-    makefun_bars.run(trader.on_batch)
+_TRADER = DipTrader()
 
 
-if __name__ == "__main__":
-    main()
+def on_batch(state, batch):
+    return _TRADER.decide(state, batch)
+
+
+makefun_bars.run(on_batch)
