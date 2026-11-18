@@ -1,8 +1,16 @@
+# btc-race-20261118
+
+[![make.fun · btc-race-24h-20261118-1444](https://make.fun/badge/btc-race-24h-20261118-1444.svg)](https://make.fun/bounty/btc-race-24h-20261118-1444?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261118-1444)
+[![rank](https://make.fun/badge/btc-race-24h-20261118-1444/jvstdyz/btc-race-20261118/rank.svg)](https://make.fun/bounty/btc-race-24h-20261118-1444/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261118-1444)
+[![reward](https://make.fun/badge/btc-race-24h-20261118-1444/jvstdyz/btc-race-20261118/reward.svg)](https://make.fun/bounty/btc-race-24h-20261118-1444?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261118-1444)
+
 # Dip-buy cbBTC bot — make.fun BTC 24h race (2026-11-18)
 
-A bot that trades Coinbase Wrapped BTC (cbBTC) against USDC, minute by minute,
-on 1-minute on-chain bars from its Orca Whirlpool. It waits for a sharp
-intraday flush, buys it once at full size, and sells the recovery.
+A bot for make.fun's "Race a BTC trading bot live for 24 hours"
+(`btc-race-24h-20261118-1444`). It trades Coinbase Wrapped BTC (cbBTC)
+against USDC, minute by minute, on 1-minute on-chain bars from its Orca
+Whirlpool. It waits for a sharp intraday flush, buys it once at full size,
+and sells the recovery.
 
 ## Strategy
 
@@ -19,7 +27,7 @@ intraday flush, buys it once at full size, and sells the recovery.
 Everything is integer arithmetic on bar closes — no clock, no network, no
 randomness — so two runs on the same bars answer byte for byte the same.
 
-## Local verification (replay.py, exact re-implementation of the kit's replay)
+## Local verification (replay of the kit's own engine, exact integer arithmetic)
 
 | Window | Net PnL | Trades | Max drawdown | 2x fees |
 |---|---|---|---|---|
